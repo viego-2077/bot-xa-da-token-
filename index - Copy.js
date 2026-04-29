@@ -69,6 +69,7 @@ function defaultState() {
         ffmpegProcess: null,
         playStartTime: null,
         pausedAt: null,
+        restored: false, // đánh dấu đã restore xong chưa
     };
 }
 
@@ -79,14 +80,18 @@ function getState(client) {
     return stateMap.get(client.user.id);
 }
 
-// ================= PERSISTENT STATE (PER USER) =================
+// ================= PERSISTENT STATE =================
 function savePersistentState(userId) {
+    // Đọc file hiện tại, không ghi đè toàn bộ
     let data = {};
     try {
         if (fs.existsSync(STATE_FILE)) {
-            data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+            const raw = fs.readFileSync(STATE_FILE, 'utf8');
+            if (raw.trim()) data = JSON.parse(raw);
         }
-    } catch(e) {}
+    } catch(e) {
+        log(`Loi doc state.json: ${e.message}`);
+    }
 
     const s = stateMap.get(userId);
     if (!s) return;
@@ -101,16 +106,23 @@ function savePersistentState(userId) {
         volume: s.volume,
     };
 
-    try { fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2)); } catch(e) {}
+    try { fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2)); } catch(e) {
+        log(`Loi ghi state.json: ${e.message}`);
+    }
 }
 
 function loadPersistentState(userId) {
     try {
         if (fs.existsSync(STATE_FILE)) {
-            const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-            return data[userId] || null;
+            const raw = fs.readFileSync(STATE_FILE, 'utf8');
+            if (raw.trim()) {
+                const data = JSON.parse(raw);
+                return data[userId] || null;
+            }
         }
-    } catch(e) {}
+    } catch(e) {
+        log(`Loi parse state.json: ${e.message}`);
+    }
     return null;
 }
 
@@ -195,7 +207,7 @@ async function applyFxNow(client) {
 
     state.playStartTime = Date.now() - elapsed * 1000;
     state.pausedAt = wasPaused ? Date.now() : null;
-    log(`FX: ${state.fxType}=${state.fxValue} (seek ${elapsed.toFixed(2)}s)`, client.tokenIndex);
+    log(`FX: ${state.fxType}=${state.fxValue}`, client.tokenIndex);
     savePersistentState(client.user.id);
 }
 
@@ -207,6 +219,40 @@ function startHeartbeat(connection, state) {
             try { connection.setSpeaking(true); } catch(e) {}
         }
     }, 20000);
+}
+
+// ================= JOIN VOICE WITH RETRY =================
+async function safeJoinVoice(channel, client, retries = 3) {
+    const state = getState(client);
+    let lastError = null;
+    
+    for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+            if (state.connection && state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+                state.connection.destroy();
+            }
+            
+            const connection = joinVoiceChannel({
+                channelId: channel.id,
+                guildId: channel.guild.id,
+                adapterCreator: channel.guild.voiceAdapterCreator,
+                group: client.user.id,
+                selfMute: false,
+                selfDeaf: true
+            });
+            
+            await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+            return connection;
+        } catch (err) {
+            lastError = err;
+            log(`Join voice attempt ${attempt + 1} failed: ${err.message}`, client.tokenIndex);
+            // Đợi 3 giây rồi thử lại
+            if (attempt < retries - 1) {
+                await new Promise(r => setTimeout(r, 3000));
+            }
+        }
+    }
+    throw lastError || new Error("Khong the join voice");
 }
 
 // ================= PLAY MUSIC =================
@@ -248,18 +294,7 @@ async function playMusic(filePath, channelId, client) {
         });
         state.player.on('error', err => log(`Player error: ${err.message}`, client.tokenIndex));
 
-        if (state.connection && state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-            state.connection.destroy();
-        }
-        const connection = joinVoiceChannel({
-            channelId: channel.id,
-            guildId: channel.guild.id,
-            adapterCreator: channel.guild.voiceAdapterCreator,
-            group: client.user.id,
-            selfMute: false,
-            selfDeaf: true
-        });
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+        const connection = await safeJoinVoice(channel, client);
         connection.subscribe(state.player);
         state.player.play(resource);
         try { connection.setSpeaking(true); } catch(e) {}
@@ -267,6 +302,7 @@ async function playMusic(filePath, channelId, client) {
         state.connection = connection;
         state.activeVoiceChannel = channelId;
         startHeartbeat(connection, state);
+        state.restored = true;
         savePersistentState(client.user.id);
 
         connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -341,18 +377,7 @@ async function startShuffle(channelId, client) {
     const channel = await client.channels.fetch(channelId);
     if (!channel?.isVoice()) throw new Error("Kenh khong phai voice");
 
-    if (state.connection && state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-        state.connection.destroy();
-    }
-    const connection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-        group: client.user.id,
-        selfMute: false,
-        selfDeaf: true
-    });
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    const connection = await safeJoinVoice(channel, client);
     connection.subscribe(state.player);
     playNext();
     try { connection.setSpeaking(true); } catch(e) {}
@@ -361,6 +386,7 @@ async function startShuffle(channelId, client) {
     state.activeVoiceChannel = channelId;
     state.shuffleMode = true;
     startHeartbeat(connection, state);
+    state.restored = true;
     savePersistentState(client.user.id);
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -384,8 +410,14 @@ async function startShuffle(channelId, client) {
 
 // ================= RESTORE SESSION =================
 async function restoreSession(client) {
+    // Đợi 1 chút để session cũ kịp timeout
+    await new Promise(r => setTimeout(r, 2000));
+
     const cfg = loadPersistentState(client.user.id);
-    if (!cfg || !cfg.activeVoiceChannel) return;
+    if (!cfg || !cfg.activeVoiceChannel) {
+        log("Khong co state de khoi phuc (da exit truoc do)", client.tokenIndex);
+        return;
+    }
 
     const state = getState(client);
     state.volume = cfg.volume || 1.0;
@@ -395,34 +427,38 @@ async function restoreSession(client) {
     state.currentFile = cfg.currentFile || null;
     state.currentChannelId = cfg.currentChannelId || cfg.activeVoiceChannel;
 
-    if (!state.currentChannelId) return;
+    if (!state.currentChannelId) {
+        log("Khong co channel de restore", client.tokenIndex);
+        return;
+    }
 
     try {
+        const channel = await client.channels.fetch(state.currentChannelId);
+        if (!channel?.isVoice()) {
+            log("Kenh khong ton tai hoac khong phai voice", client.tokenIndex);
+            // Xóa state cũ vì channel không hợp lệ
+            state.activeVoiceChannel = null;
+            state.shuffleMode = false;
+            state.currentFile = null;
+            savePersistentState(client.user.id);
+            return;
+        }
+
         if (state.shuffleMode) {
             log("Khoi phuc shuffle...", client.tokenIndex);
             await startShuffle(state.currentChannelId, client);
-        } else if (state.currentFile && state.currentChannelId) {
-            log("Khoi phuc phat bai don...", client.tokenIndex);
+        } else if (state.currentFile) {
+            log(`Khoi phuc phat bai: ${path.basename(state.currentFile)}`, client.tokenIndex);
             await playMusic(state.currentFile, state.currentChannelId, client);
-        } else if (state.currentChannelId) {
-            const channel = await client.channels.fetch(state.currentChannelId);
-            if (channel?.isVoice()) {
-                const connection = joinVoiceChannel({
-                    channelId: channel.id,
-                    guildId: channel.guild.id,
-                    adapterCreator: channel.guild.voiceAdapterCreator,
-                    group: client.user.id,
-                    selfMute: false,
-                    selfDeaf: true
-                });
-                await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-                state.connection = connection;
-                state.activeVoiceChannel = state.currentChannelId;
-                startHeartbeat(connection, state);
-                log("Da join lai voice.", client.tokenIndex);
-            }
+        } else {
+            log("Khoi phuc join voice (khong phat)...", client.tokenIndex);
+            const connection = await safeJoinVoice(channel, client);
+            state.connection = connection;
+            state.activeVoiceChannel = state.currentChannelId;
+            startHeartbeat(connection, state);
+            state.restored = true;
+            savePersistentState(client.user.id);
         }
-        savePersistentState(client.user.id);
     } catch (err) {
         log(`Khong the khoi phuc: ${err.message}`, client.tokenIndex);
     }
@@ -438,8 +474,9 @@ for (let i = 0; i < tokens.length; i++) {
 
     client.on("ready", async () => {
         log(`Ready! ${client.user.tag} (${client.user.id})`, client.tokenIndex);
+        // Khởi tạo state trong RAM ngay
         getState(client);
-        savePersistentState(client.user.id);
+        // Restore session (có delay 2s bên trong)
         await restoreSession(client);
     });
 
@@ -592,6 +629,7 @@ for (let i = 0; i < tokens.length; i++) {
                 state.currentFile = null;
                 state.playStartTime = null;
                 state.pausedAt = null;
+                state.restored = false;
                 if (canSend()) await msg.channel.send("Da roi voice");
                 savePersistentState(client.user.id);
             }
